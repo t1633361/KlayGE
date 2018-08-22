@@ -26,6 +26,9 @@
 #include <KlayGE/InputFactory.hpp>
 
 #include <vector>
+#include <iostream>
+#include <iomanip>
+#include <fstream>
 #include <sstream>
 
 #include "SampleCommon.hpp"
@@ -594,36 +597,215 @@ namespace
 		return rg / static_cast<float>(NUM_SAMPLES);
 	}
 
-	TexturePtr GenIntegratedBRDF()
+	void GenIntegratedBRDF(uint32_t width, uint32_t height, std::vector<float2>& integrate_brdf_f32)
 	{
-		uint32_t const WIDTH = 128;
-		uint32_t const HEIGHT = 128;
-
-		std::vector<uint8_t> integrate_brdf_gr(WIDTH * HEIGHT * 2);
-		for (uint32_t y = 0; y < HEIGHT; ++ y)
+		integrate_brdf_f32.resize(width * height);
+		for (uint32_t y = 0; y < height; ++y)
 		{
-			float shininess = Glossiness2Shininess((y + 0.5f) / HEIGHT);
-			for (uint32_t x = 0; x < WIDTH; ++ x)
+			float shininess = Glossiness2Shininess((y + 0.5f) / height);
+			for (uint32_t x = 0; x < width; ++x)
 			{
-				float cos_theta = (x + 0.5f) / WIDTH;
+				float cos_theta = (x + 0.5f) / width;
 
-				float2 const lut = IntegrateBRDFBP(shininess, cos_theta);
-				integrate_brdf_gr[(y * WIDTH + x) * 2 + 0]
+				integrate_brdf_f32[y * width + x] = IntegrateBRDFBP(shininess, cos_theta);
+			}
+		}
+	}
+
+	TexturePtr GenIntegratedBRDF(uint32_t width, uint32_t height)
+	{
+		std::vector<float2> integrate_brdf_f32(width * height);
+		GenIntegratedBRDF(width, height, integrate_brdf_f32);
+
+		std::vector<uint8_t> integrate_brdf_gr(width * height * 2);
+		for (uint32_t y = 0; y < height; ++ y)
+		{
+			for (uint32_t x = 0; x < width; ++ x)
+			{
+				float2 const lut = integrate_brdf_f32[y * width + x];
+				integrate_brdf_gr[(y * width + x) * 2 + 0]
 					= static_cast<uint8_t>(MathLib::clamp(static_cast<int>(lut.x() * 255 + 0.5f), 0, 255));
-				integrate_brdf_gr[(y * WIDTH + x) * 2 + 1]
+				integrate_brdf_gr[(y * width + x) * 2 + 1]
 					= static_cast<uint8_t>(MathLib::clamp(static_cast<int>(lut.y() * 100 * 255 + 0.5f), 0, 255));
 			}
 		}
 
 		ElementInitData init_data;
 		init_data.data = &integrate_brdf_gr[0];
-		init_data.row_pitch = WIDTH * 2;
-		init_data.slice_pitch = init_data.row_pitch * HEIGHT;
+		init_data.row_pitch = width * 2;
+		init_data.slice_pitch = init_data.row_pitch * height;
 
-		TexturePtr ret = MakeSharedPtr<SoftwareTexture>(Texture::TT_2D, WIDTH, HEIGHT, 1, 1, 1, EF_GR8, false);
+		TexturePtr ret = MakeSharedPtr<SoftwareTexture>(Texture::TT_2D, width, height, 1, 1, 1, EF_GR8, false);
 		ret->CreateHWResource(init_data, nullptr);
 
 		return ret;
+	}
+
+	void GenFittedBRDF(uint32_t width, uint32_t height, std::vector<float2>& fitted_brdf_f32,
+		ArrayRef<float4> r_factors, ArrayRef<float4> g_factors)
+	{
+		fitted_brdf_f32.resize(width * height);
+		for (uint32_t y = 0; y < height; ++y)
+		{
+			float glossiness = (y + 0.5f) / height;
+			for (uint32_t x = 0; x < width; ++x)
+			{
+				float n_dot_v = (x + 0.5f) / width;
+
+				float2 env_brdf;
+				float4 tmp = ((r_factors[0] * glossiness + r_factors[1]) * glossiness + r_factors[2]) * glossiness + r_factors[3];
+				env_brdf.x() = (((tmp.x() * n_dot_v + tmp.y()) * n_dot_v + tmp.z()) * n_dot_v) + tmp.w();
+				tmp = ((g_factors[0] * glossiness + g_factors[1]) * glossiness + g_factors[2]) * glossiness + g_factors[3];
+				env_brdf.y() = (((tmp.x() * n_dot_v + tmp.y()) * n_dot_v + tmp.z()) * n_dot_v) + tmp.w();
+
+				fitted_brdf_f32[y * width + x] = env_brdf;
+			}
+		}
+	}
+
+	std::array<float4, 4> r_min_factors_base =
+	{
+		float4(-4.996914762f, 7.253111161f, -1.963867075f, -0.170416225f),
+		float4(8.993475061f, -15.42473953f, 4.712593001f, 0.448102365f),
+		float4(-4.928234727f, 10.95286522f, -3.852980973f, -0.389332014f),
+		float4(0.846124834f, -1.596815751f, 1.005729748f, 0.113484128f),
+	};
+	std::array<float4, 4> g_min_factors_base =
+	{
+		float4(-0.684077741f, 1.316163916f, -0.70869252f, 0.073264505f),
+		float4(0.719315865f, -1.384932814f, 0.775880046f, -0.105818706f),
+		float4(-0.101034049f, 0.18680998f, -0.117919199f, 0.030727381f),
+		float4(0.001922126f, 0.006697305f, -0.015741592f, 0.007229544f),
+	};
+
+	/*std::array<float4, 4> r_min_factors_base =
+	{
+		float4(3.221071959f, -4.037492752f, 2.019851685f, -0.3509000242f),
+		float4(-5.483835697f, 4.748570442f, -2.599167109f, 0.8398050666f),
+		float4(2.386495829f, 0.3970752358f, 0.1965616345f, -0.6608897448f),
+		float4(-0.2426506728f, 0.05738930777f, 0.318114996f, 0.1741847545f),
+	};
+	std::array<float4, 4> g_min_factors_base =
+	{
+		float4(-0.645807467f, 1.143745551f, -0.578012509f, 0.069540519f),
+		float4(0.895991894f, -1.581523545f, 0.81029122f, -0.108531864f),
+		float4(-0.088478638f, 0.154233504f, -0.098784305f, 0.029798974f),
+		float4(0.001030646f, 0.008038982f, -0.016316089f, 0.007532373f),
+	};*/
+
+	/*std::array<float4, 4> r_min_factors_base =
+	{
+		float4(-5.007778645f, 7.293953896f, -1.907309175f, -0.1206253022f),
+		float4(8.907556534f, -15.47574711f, 4.687587261f, 0.3584110737f),
+		float4(-4.967802525f, 10.98999023f, -3.789376259f, -0.3670679927f),
+		float4(0.7464270592f, -1.409470797f, 0.8972253203f, 0.1270314604f),
+	};*/
+	/*std::array<float4, 4> g_min_factors_base =
+	{
+		float4(0.08464413881f, -0.07939822972f, -0.01493996941f, 0.01321539562f),
+		float4(0.05611684546f, -0.1332600266f, 0.1216740161f, -0.03741907328f),
+		float4(0.08143761009f, -0.1742649525f, 0.07545723021f, 0.009997341782f),
+		float4(0.01081173308f, -0.0009252178716f, -0.01606068946f, 0.007906299084f),
+	};*/
+
+	void GenFittedBRDF(uint32_t width, uint32_t height, std::vector<float2>& fitted_brdf_f32)
+	{
+		GenFittedBRDF(width, height, fitted_brdf_f32,
+			ArrayRef<float4>(r_min_factors_base.data(), r_min_factors_base.size()),
+			ArrayRef<float4>(g_min_factors_base.data(), g_min_factors_base.size()));
+	}
+
+	TexturePtr GenFittedBRDF(uint32_t width, uint32_t height)
+	{
+		std::vector<float2> fitted_brdf_f32(width * height);
+		GenFittedBRDF(width, height, fitted_brdf_f32);
+
+		std::vector<uint8_t> fitted_brdf_gr(width * height * 2);
+		for (uint32_t y = 0; y < height; ++ y)
+		{
+			for (uint32_t x = 0; x < width; ++ x)
+			{
+				float2 const & env_brdf = fitted_brdf_f32[y * width + x];
+
+				fitted_brdf_gr[(y * width + x) * 2 + 0]
+					= static_cast<uint8_t>(MathLib::clamp(static_cast<int>(env_brdf.x() * 255 + 0.5f), 0, 255));
+				fitted_brdf_gr[(y * width + x) * 2 + 1]
+					= static_cast<uint8_t>(MathLib::clamp(static_cast<int>(env_brdf.y() * 100 * 255 + 0.5f), 0, 255));
+			}
+		}
+
+		ElementInitData init_data;
+		init_data.data = &fitted_brdf_gr[0];
+		init_data.row_pitch = width * 2;
+		init_data.slice_pitch = init_data.row_pitch * height;
+
+		TexturePtr ret = MakeSharedPtr<SoftwareTexture>(Texture::TT_2D, width, height, 1, 1, 1, EF_GR8, false);
+		ret->CreateHWResource(init_data, nullptr);
+
+		return ret;
+	}
+
+	void MSEFitting(std::vector<float2> const & integrated_brdf, std::vector<float2> const & fitted_brdf,
+		uint32_t width, uint32_t height, float2& mse, float2& min_diff, float2& max_diff)
+	{
+		mse = float2(0, 0);
+		min_diff = float2(1, 1);
+		max_diff = float2(-1, -1);
+		for (uint32_t y = 0; y < height; ++ y)
+		{
+			for (uint32_t x = 0; x < width; ++ x)
+			{
+				float2 const diff = integrated_brdf[y * width + x] - fitted_brdf[y * width + x];
+
+				min_diff.x() = std::min(min_diff.x(), diff.x());
+				max_diff.x() = std::max(max_diff.x(), diff.x());
+
+				min_diff.y() = std::min(min_diff.y(), diff.y());
+				max_diff.y() = std::max(max_diff.y(), diff.y());
+
+				mse.x() += diff.x() * diff.x();
+				mse.y() += diff.y() * diff.y();
+			}
+		}
+
+		mse /= (width * height);
+	}
+
+	void MSEFitting(Texture& integrated_brdf_tex, Texture& fitted_brdf_tex, float2& mse, float2& min_diff, float2& max_diff)
+	{
+		uint32_t const WIDTH = 128;
+		uint32_t const HEIGHT = 128;
+
+		Texture::Mapper integrated_brdf_mapper(integrated_brdf_tex, 0, 0, TMA_Read_Only, 0, 0, WIDTH, HEIGHT);
+		Texture::Mapper fitted_brdf_mapper(fitted_brdf_tex, 0, 0, TMA_Read_Only, 0, 0, WIDTH, HEIGHT);
+
+		uint8_t* intergrated_ptr = integrated_brdf_mapper.Pointer<uint8_t>();
+		uint8_t* fitted_ptr = fitted_brdf_mapper.Pointer<uint8_t>();
+
+		mse = float2(0, 0);
+		min_diff = float2(1, 1);
+		max_diff = float2(-1, -1);
+		for (uint32_t y = 0; y < HEIGHT; ++ y)
+		{
+			for (uint32_t x = 0; x < WIDTH; ++ x)
+			{
+				float diff_r = (intergrated_ptr[y * integrated_brdf_mapper.RowPitch() + x * 2 + 0]
+					- fitted_ptr[y * fitted_brdf_mapper.RowPitch() + x * 2 + 0]) / 255.0f;
+				float diff_g = (intergrated_ptr[y * integrated_brdf_mapper.RowPitch() + x * 2 + 1]
+					- fitted_ptr[y * fitted_brdf_mapper.RowPitch() + x * 2 + 1]) / 100.0f / 255.0f;
+
+				min_diff.x() = std::min(min_diff.x(), diff_r);
+				max_diff.x() = std::max(max_diff.x(), diff_r);
+
+				min_diff.y() = std::min(min_diff.y(), diff_g);
+				max_diff.y() = std::max(max_diff.y(), diff_g);
+
+				mse.x() += diff_r * diff_r;
+				mse.y() += diff_g * diff_g;
+			}
+		}
+
+		mse /= (WIDTH * HEIGHT);
 	}
 }
 
@@ -646,13 +828,138 @@ EnvLightingApp::EnvLightingApp()
 
 void EnvLightingApp::OnCreate()
 {
+	uint32_t const WIDTH = 128;
+	uint32_t const HEIGHT = 128;
+
 	font_ = SyncLoadFont("gkai00mp.kfont");
 
 	TexturePtr y_cube_map = ASyncLoadTexture("uffizi_cross_filtered_y.dds", EAH_GPU_Read | EAH_Immutable);
 	TexturePtr c_cube_map = ASyncLoadTexture("uffizi_cross_filtered_c.dds", EAH_GPU_Read | EAH_Immutable);
 	if (ResLoader::Instance().Locate("IntegratedBRDF.dds").empty())
 	{
-		SaveTexture(GenIntegratedBRDF(), "../../Samples/media/EnvLighting/IntegratedBRDF.dds");
+		SaveTexture(GenIntegratedBRDF(WIDTH, HEIGHT), "../../Samples/media/EnvLighting/IntegratedBRDF.dds");
+		SaveTexture(GenFittedBRDF(WIDTH, HEIGHT), "../../Samples/media/EnvLighting/FittedBRDF.dds");
+	}
+
+	{
+		uint32_t const width = 128;
+		uint32_t const height = 32;
+
+		std::vector<float2> integrated_brdf;
+		GenIntegratedBRDF(width, height, integrated_brdf);
+
+		std::vector<float2> fitted_brdf;
+		GenFittedBRDF(width, height, fitted_brdf);
+
+		{
+			std::ofstream ofs_x("IntegratedBRDF_128_32_x.csv");
+			std::ofstream ofs_y("IntegratedBRDF_128_32_y.csv");
+
+			ofs_x << std::setprecision(10);
+			ofs_y << std::setprecision(10);
+
+			for (uint32_t y = 0; y < height; ++ y)
+			{
+				for (uint32_t x = 0; x < width; ++ x)
+				{
+					float2 const lut = integrated_brdf[y * width + x];
+
+					ofs_x << lut.x() << ',';
+					ofs_y << lut.y() << ',';
+				}
+				ofs_x << endl;
+				ofs_y << endl;
+			}
+		}
+
+		float2 mse;
+		float2 min_diff;
+		float2 max_diff;
+		MSEFitting(integrated_brdf, fitted_brdf, width, height, mse, min_diff, max_diff);
+
+		float2 psnr;
+		psnr.x() = 10 * -log10(mse.x());
+		psnr.y() = 10 * -log10(mse.y());
+
+		std::cout << "Fitted 128x32" << std::endl;
+
+		std::cout << "Min: (" << min_diff.x() << ", " << min_diff.y() << ")" << std::endl;
+		std::cout << "Max: (" << max_diff.x() << ", " << max_diff.y() << ")" << std::endl;
+		std::cout << "MSE: (" << mse.x() << ", " << mse.y() << ")" << std::endl;
+		std::cout << "PSNR: (" << psnr.x() << ", " << psnr.y() << ")" << std::endl << std::endl;
+	}
+
+	{
+		TexturePtr integrated_brdf_tex = LoadSoftwareTexture("IntegratedBRDF.dds");
+		TexturePtr integrated_brdf_small_tex = GenIntegratedBRDF(WIDTH, HEIGHT / 4);
+
+		TexturePtr integrated_brdf_restored_tex = MakeSharedPtr<SoftwareTexture>(Texture::TT_2D, WIDTH, HEIGHT, 1, 1, 1, EF_GR8, false);
+		integrated_brdf_restored_tex->CreateHWResource({}, nullptr);
+		integrated_brdf_small_tex->CopyToTexture(*integrated_brdf_restored_tex);
+
+		float2 mse;
+		float2 min_diff;
+		float2 max_diff;
+		MSEFitting(*integrated_brdf_tex, *integrated_brdf_restored_tex, mse, min_diff, max_diff);
+
+		float2 psnr;
+		psnr.x() = 10 * -log10(mse.x());
+		psnr.y() = 10 * -log10(mse.y());
+
+		std::cout << "Small Integrated: (" << WIDTH << ", " << HEIGHT / 4 << ")" << std::endl;
+
+		std::cout << "Min: (" << min_diff.x() << ", " << min_diff.y() << ")" << std::endl;
+		std::cout << "Max: (" << max_diff.x() << ", " << max_diff.y() << ")" << std::endl;
+		std::cout << "MSE: (" << mse.x() << ", " << mse.y() << ")" << std::endl;
+		std::cout << "PSNR: (" << psnr.x() << ", " << psnr.y() << ")" << std::endl << std::endl;
+	}
+	{
+		TexturePtr integrated_brdf_tex = LoadSoftwareTexture("IntegratedBRDF.dds");
+		TexturePtr integrated_brdf_small_tex = GenIntegratedBRDF(WIDTH / 4, HEIGHT / 4);
+
+		TexturePtr integrated_brdf_restored_tex = MakeSharedPtr<SoftwareTexture>(Texture::TT_2D, WIDTH, HEIGHT, 1, 1, 1, EF_GR8, false);
+		integrated_brdf_restored_tex->CreateHWResource({}, nullptr);
+		integrated_brdf_small_tex->CopyToTexture(*integrated_brdf_restored_tex);
+
+		float2 mse;
+		float2 min_diff;
+		float2 max_diff;
+		MSEFitting(*integrated_brdf_tex, *integrated_brdf_restored_tex, mse, min_diff, max_diff);
+
+		float2 psnr;
+		psnr.x() = 10 * -log10(mse.x());
+		psnr.y() = 10 * -log10(mse.y());
+
+		std::cout << "Small Integrated: (" << WIDTH / 4 << ", " << HEIGHT / 4 << ")" << std::endl;
+
+		std::cout << "Min: (" << min_diff.x() << ", " << min_diff.y() << ")" << std::endl;
+		std::cout << "Max: (" << max_diff.x() << ", " << max_diff.y() << ")" << std::endl;
+		std::cout << "MSE: (" << mse.x() << ", " << mse.y() << ")" << std::endl;
+		std::cout << "PSNR: (" << psnr.x() << ", " << psnr.y() << ")" << std::endl << std::endl;
+	}
+	{
+		TexturePtr integrated_brdf_tex = LoadSoftwareTexture("IntegratedBRDF.dds");
+		TexturePtr integrated_brdf_small_tex = GenIntegratedBRDF(16, 4);
+
+		TexturePtr integrated_brdf_restored_tex = MakeSharedPtr<SoftwareTexture>(Texture::TT_2D, WIDTH, HEIGHT, 1, 1, 1, EF_GR8, false);
+		integrated_brdf_restored_tex->CreateHWResource({}, nullptr);
+		integrated_brdf_small_tex->CopyToTexture(*integrated_brdf_restored_tex);
+
+		float2 mse;
+		float2 min_diff;
+		float2 max_diff;
+		MSEFitting(*integrated_brdf_tex, *integrated_brdf_restored_tex, mse, min_diff, max_diff);
+
+		float2 psnr;
+		psnr.x() = 10 * -log10(mse.x());
+		psnr.y() = 10 * -log10(mse.y());
+
+		std::cout << "Small Integrated: (" << 16 << ", " << 4 << ")" << std::endl;
+
+		std::cout << "Min: (" << min_diff.x() << ", " << min_diff.y() << ")" << std::endl;
+		std::cout << "Max: (" << max_diff.x() << ", " << max_diff.y() << ")" << std::endl;
+		std::cout << "MSE: (" << mse.x() << ", " << mse.y() << ")" << std::endl;
+		std::cout << "PSNR: (" << psnr.x() << ", " << psnr.y() << ")" << std::endl << std::endl;
 	}
 
 	auto& rf = Context::Instance().RenderFactoryInstance();
